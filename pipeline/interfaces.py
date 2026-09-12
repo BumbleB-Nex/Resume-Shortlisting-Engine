@@ -26,6 +26,16 @@ _SPECIAL = {
     "html": "HTML", "css": "CSS", "json": "JSON", "ui/ux": "UI/UX", "api": "API",
     "sqlite": "SQLite", "php": "PHP", "jwt": "JWT", "c++": "C++", "c#": "C#",
     "nosql databases": "NoSQL Databases", "websockets": "WebSockets", "redux": "Redux",
+    "siem": "SIEM", "ids/ips": "IDS/IPS", "iam": "IAM", "edr": "EDR", "itil": "ITIL",
+    "kpi": "KPI", "etl": "ETL", "gdpr": "GDPR", "nist": "NIST", "hipaa": "HIPAA",
+    "owasp": "OWASP", "nmap": "Nmap", "sas": "SAS", "spss": "SPSS", "ceh": "CEH",
+    "cissp": "CISSP", "cism": "CISM", "cisa": "CISA", "oscp": "OSCP", "a/b testing": "A/B Testing",
+    "it support": "IT Support", "servicenow": "ServiceNow", "powershell": "PowerShell",
+    "comptia security+": "CompTIA Security+", "comptia a+": "CompTIA A+", "mfa": "MFA",
+    "iso 27001": "ISO 27001", "soc 2": "SOC 2", "pci dss": "PCI DSS", "qradar": "QRadar",
+    "crowdstrike": "CrowdStrike", "sentinelone": "SentinelOne", "linkedin": "LinkedIn",
+    "wordpress": "WordPress", "seo": "SEO", "cms": "CMS", "nlp": "NLP", "dbt": "dbt",
+    "bigquery": "BigQuery", "mongodb": "MongoDB", "lookml": "LookML", "dax": "DAX",
 }
 
 

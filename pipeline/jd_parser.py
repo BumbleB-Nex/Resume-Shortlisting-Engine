@@ -16,8 +16,11 @@ from pathlib import Path
 import requests
 
 from config import (
+    DERIVED_MUST_HAVE_MIN_SKILLS,
+    DERIVED_TASK_MUST_HAVES,
     JD_MIN_REQUIREMENTS_BEFORE_FALLBACK,
     MAX_MUST_HAVE,
+    MAX_PREFERRED,
     OLLAMA_MODEL,
     OLLAMA_TIMEOUT_SEC,
     OLLAMA_URL,
@@ -43,6 +46,12 @@ _MUST_HEADERS = [
     "person specification", "knowledge and skills", "skills and experience",
     "skills & experience", "experience required", "candidate profile", "your profile",
     "who you are", "software", "tools", "technical competencies", "competencies",
+    "knowledge skills and abilities", "knowledge skills & abilities", "skills and abilities",
+    "skills abilities", "essential criteria", "essential requirements", "what you need",
+    "what you'll need", "what you will need", "the ideal candidate", "ideal candidate",
+    "requirements and qualifications", "qualifications and skills", "what we need",
+    "required experience", "experience and skills", "knowledge and experience",
+    "requirement", "qualification", "skill", "prerequisites", "prerequisite",
 ]
 _PREF_HEADERS = [
     "preferred", "preferred skills", "preferred qualifications", "nice to have",
@@ -51,13 +60,17 @@ _PREF_HEADERS = [
     "it would be great if", "brownie points", "stand out", "desired", "ideally",
     "extra credit", "even better if", "not required but", "what will make you stand out",
     "what would make you stand out", "additional skills", "other skills",
+    "desirable criteria", "desired skills", "preferred experience", "nice to haves",
 ]
 _RESP_HEADERS = [
     "responsibilities", "key responsibilities", "roles and responsibilities",
     "what you'll do", "what you will do", "your role", "the role", "duties",
     "day-to-day", "day to day", "you will", "job responsibilities", "what you'll be doing",
     "key accountabilities", "accountabilities", "main duties", "tasks", "scope of work",
-    "what you'll work on", "deliverables",
+    "what you'll work on", "deliverables", "description of work", "duties and responsibilities",
+    "job duties", "essential functions", "essential duties", "primary responsibilities",
+    "key duties", "role responsibilities", "responsible for", "job tasks",
+    "tasks and responsibilities", "tasks & responsibilities", "responsibility", "duty",
 ]
 _IGNORE_HEADERS = [
     "about us", "about the company", "about the role", "about", "company overview",
@@ -68,7 +81,33 @@ _IGNORE_HEADERS = [
     "description", "key summary", "summary", "reports to", "department", "grade",
     "experience", "education", "our culture", "diversity", "disclaimer", "note",
     "working hours", "hours", "term", "contract", "start date", "closing date",
+    # HR / government position-description boilerplate
+    "ada checklist", "physical activity", "physical activities", "physical requirements",
+    "physical demands", "working conditions", "work environment", "visual acuity",
+    "cognitive/mental capabilities", "mental capabilities", "equal employment", "eeo",
+    "license or certification", "licenses and certifications", "job purpose", "purpose",
+    "position summary", "position description", "classification title", "working title",
+    "employee number", "supervisor", "work schedule", "work hours", "primary purpose",
+    "organizational unit", "position justification", "position number", "department/agency",
+    "division", "section/unit", "training", "period", "employment agreement",
+    "general availability", "emergency status", "appeals process", "resignation",
+    "termination", "agreement renewal", "holiday shifts", "time-off requests",
+    "outside employment", "our values", "mission", "vision", "recruitment process",
+    "interview process", "next steps", "selection process", "travel requirements",
+    "travel", "education and experience", "conduct history", "academic standing",
 ]
+# a header that starts a line is recognised even when the line is long
+# ("Knowledge, Skills, and Abilities Recommended in this Position") — only for
+# distinctive multi-word labels so "Experience building web apps" stays content.
+_MIN_PREFIX_LABEL_LEN = 15
+# statements that describe the programme / candidate's journey, not a skill
+_DERIVE_BLACKLIST_RE = re.compile(
+    r"\b(apprenticeship|apprentice|training programme|training program|learning|"
+    r"assessments? associated|working relationships?|relationships? with|"
+    r"complete (?:all|the)|timescales|under supervision|develop an understanding|"
+    r"gain (?:practical )?experience|probation\w*|attend\w*|onboarding|induction|"
+    r"shadow(?:ing)?|mentor(?:ing|ed)?|wider organisation|wider organization|"
+    r"escalating issues|escalate)\b", re.I)
 # statements about the candidate's status rather than skills
 _ELIGIBILITY_RE = re.compile(
     r"\b(pursuing|bachelor|master'?s?|degree|b\.?\s?tech|b\.?e\.?|m\.?\s?tech|mca|bca|"
@@ -120,20 +159,62 @@ _SPLIT_RE = re.compile(r"\s*(?:,|;|/|\band\b|\bor\b|&|\bas well as\b|\bplus\b)\s
 
 # ── Public API ────────────────────────────────────────────────────
 def parse_jd(pdf_path: str | Path) -> list[Requirement]:
-    raw, _ = extract_pdf_text(pdf_path)
-    text = clean_text(raw)
-    return parse_jd_text(text)
+    return parse_jd_meta(pdf_path)[0]
 
 
 def parse_jd_text(text: str) -> list[Requirement]:
     """Parse already-extracted JD text (used by tests and the UI)."""
+    return parse_jd_text_meta(text)[0]
+
+
+def parse_jd_meta(pdf_path: str | Path) -> tuple[list[Requirement], dict]:
+    """`parse_jd` plus a metadata dict (see `parse_jd_text_meta`)."""
+    raw, _ = extract_pdf_text(pdf_path)
+    return parse_jd_text_meta(clean_text(raw))
+
+
+def parse_jd_text_meta(text: str) -> tuple[list[Requirement], dict]:
+    """
+    Parse JD text and return (requirements, meta). `meta` keys:
+      explicit_must_have   must-haves found in an explicit requirements section
+      derived_must_have    must-haves promoted from responsibilities / prose
+      derived              True when the mandatory list had to be derived
+      derived_terms        the promoted canonical terms
+      notice               one-line human-readable note (or None)
+      source               "regex" | "ollama"
+    """
+    global _LAST_META
     buckets = _regex_structure(text)
+    source = "regex"
     total = sum(len(v) for v in buckets.values())
     if total < JD_MIN_REQUIREMENTS_BEFORE_FALLBACK:
         fallback = _ollama_structure(text)
         if fallback and sum(len(v) for v in fallback.values()) > total:
-            buckets = fallback
-    return _build_requirements(buckets)
+            buckets, source = fallback, "ollama"
+    reqs = _build_requirements(buckets)
+    explicit = sum(1 for r in reqs if r.weight == "must_have")
+    meta: dict = {"explicit_must_have": explicit, "derived_must_have": 0, "derived": False,
+                  "derived_terms": [], "notice": None, "source": source}
+    if explicit == 0:
+        derived = _derive_must_haves(reqs, buckets, text)
+        if derived:
+            meta.update(derived_must_have=len(derived), derived=True, derived_terms=derived)
+            meta["notice"] = (f"no explicit requirements section; derived {len(derived)} "
+                              f"must-haves from responsibilities")
+            print(f"[jd_parser] {meta['notice']}")
+        else:
+            meta["notice"] = "no explicit requirements section and no core skills could be derived"
+            print(f"[jd_parser] {meta['notice']}")
+    _LAST_META = meta
+    return reqs, meta
+
+
+_LAST_META: dict = {}
+
+
+def last_parse_meta() -> dict:
+    """Metadata of the most recent `parse_jd*` call (empty before any parse)."""
+    return dict(_LAST_META)
 
 
 def jd_raw_text(pdf_path: str | Path) -> str:
@@ -142,27 +223,46 @@ def jd_raw_text(pdf_path: str | Path) -> str:
 
 
 # ── Step 1: regex structuring ─────────────────────────────────────
+_LABELS: list[tuple[str, str, int]] = (
+    [(l, "preferred", 0) for l in _PREF_HEADERS]
+    + [(l, "responsibility", 1) for l in _RESP_HEADERS]
+    + [(l, "must_have", 2) for l in _MUST_HEADERS]
+    + [(l, "ignore", 3) for l in _IGNORE_HEADERS]
+)
+
+
+def _norm_header(line: str) -> str:
+    h = strip_bullet(line).strip().rstrip(":").lower()
+    h = re.sub(r"[^a-z0-9'’ /&+-]", " ", h)
+    return re.sub(r"\s+", " ", h).strip()
+
+
+def _best_label(h: str) -> tuple[str, str] | None:
+    """(label, kind) of the most specific header label contained in `h`."""
+    hits = [(len(l), -prio, l, kind) for l, kind, prio in _LABELS if _label_in(l, h)]
+    if not hits:
+        return None
+    _, _, label, kind = max(hits)
+    return label, kind
+
+
+def _label_in(label: str, h: str) -> bool:
+    # whole-word containment: "term" must not match inside "terms" unless it is the same word
+    return re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", h) is not None
+
+
 def _classify_header(line: str) -> str | None:
-    h = line.strip().rstrip(":").lower()
-    h = re.sub(r"[^a-z0-9'’ /&-]", " ", h)
-    h = re.sub(r"\s+", " ", h).strip()
+    h = _norm_header(line)
     if not h:
         return None
     if h.startswith(("about", "why ", "who we are", "our ")):
         return "ignore"
-    for label in _PREF_HEADERS:          # preferred before must (e.g. "preferred skills" vs "skills")
-        if label in h:
-            return "preferred"
-    for label in _RESP_HEADERS:
-        if label in h:
-            return "responsibility"
-    for label in _MUST_HEADERS:
-        if label in h:
-            return "must_have"
-    for label in _IGNORE_HEADERS:
-        if label in h:
-            return "ignore"
-    return None
+    if re.match(r"^\*+\s*=", line.strip()):          # "*= Required" footnote
+        return "ignore"
+    if _INTRO_HEADER_RE.search(line) and len(h.split()) <= 14:
+        return "preferred" if _PREF_INLINE.search(line) else "must_have"
+    best = _best_label(h)
+    return best[1] if best else None
 
 
 _PLACEHOLDER_RE = re.compile(r"\[[^\]]*\]|\{[^}]*\}|<[^>]*>")
@@ -203,38 +303,85 @@ def _merge_wrapped_lines(text: str) -> list[str]:
     return out
 
 
+_NUM_PREFIX_RE = re.compile(r"^\s*(?:\(?(?P<num>\d{1,2})[.)]|(?P<roman>[IVXivx]{1,4})[.)])\s+")
+_TITLE_SMALL = {"and", "of", "the", "for", "to", "in", "on", "a", "an", "&", "or", "with", "at", "by"}
+
+
+def _numbered_title(raw: str) -> str | None:
+    """
+    "II. Employment Agreement & Terms" / "1. Key Responsibilities" → "roman" | "digit"
+    when the numbered remainder is a short Title-Case section title; else None.
+    """
+    m = _NUM_PREFIX_RE.match(raw)
+    if not m:
+        return None
+    rest = raw[m.end():].strip().rstrip(":")
+    words = rest.split()
+    if not 1 <= len(words) <= 6 or re.search(r"[.;,]$|\d", rest):
+        return None
+    content = [w for w in words if re.search(r"[A-Za-z]", w)]
+    if not content or not content[0][:1].isupper():
+        return None
+    if not all(w[:1].isupper() or w.lower() in _TITLE_SMALL for w in content):
+        return None
+    return "roman" if m.group("roman") else "digit"
+
+
 def _header_kind(line: str) -> str | None:
     """
     Section kind if `line` is a header — either it *looks* like one
-    (short / Title Case / colon) or it *is* one of the known labels
-    ("Key responsibilities", "What will make you stand out").
+    (short / Title Case / colon / numbered section title) or it *is* one of
+    the known labels ("Key responsibilities", "What will make you stand out",
+    "Knowledge, Skills, and Abilities Recommended in this Position").
     """
-    s = strip_bullet(line).strip()
-    if not s or len(s) > 60 or s.endswith((".", ",", ";")):
+    raw = line.strip()
+    s = strip_bullet(raw).strip()
+    if not s or len(s) > 80 or s.endswith((".", ",", ";")):
         return None
-    h = re.sub(r"[^a-z0-9'’ /&-]", " ", s.lower())
-    h = re.sub(r"\s+", " ", h).strip()
-    if len(h.split()) > 8:
+    if re.match(r"^\*+\s*=", raw):                      # "*= Required" footnote
+        return "ignore"
+    h = _norm_header(s)
+    words = h.split()
+    if not h or len(words) > 14:
         return None
-    kind = _classify_header(s)
-    if kind is None:
+    if _INTRO_HEADER_RE.search(s):                       # "…well-versed with the following software:"
+        return "preferred" if _PREF_INLINE.search(s) else "must_have"
+    if len(words) > 10:
         return None
-    labels = _PREF_HEADERS + _RESP_HEADERS + _MUST_HEADERS + _IGNORE_HEADERS
-    best = max((len(l) for l in labels if l in h), default=0)
-    coverage = best / max(1, len(h))
+    if h.startswith(("about", "why ", "who we are", "our ")) and len(words) <= 8:
+        return "ignore"
+    ont = get_ontology()
+    numbered = _numbered_title(raw)
+    best = _best_label(h)
+    if best is None:
+        # "II. Employment Agreement & Terms" — an unknown roman-numbered section resets context
+        if numbered == "roman" and len(words) >= 2 and not ont.find_skills(s):
+            return "ignore"
+        return None
+    label, kind = best
+    coverage = len(label) / max(1, len(h))
+    if coverage >= 0.6:
+        return kind
+    if s.endswith(":"):                                  # "The duties of the intern may include:"
+        return kind
     # "Avid Compositing Software" names a tool — a header label is only incidental
-    if coverage < 0.6 and get_ontology().find_skills(s):
+    if ont.find_skills(s):
         return None
-    if looks_like_header(s) or coverage >= 0.6:
+    if looks_like_header(s) or numbered is not None:
+        return kind
+    if h.startswith(label) and len(label) >= _MIN_PREFIX_LABEL_LEN:
         return kind
     return None
 
 
 def _is_prose(content: str) -> bool:
-    """Long multi-sentence paragraphs are context, not atomic requirements."""
+    """Long multi-sentence paragraphs are context, not atomic requirements —
+    unless they are really a comma list of known skills."""
     words = content.split()
     sentences = [s for s in re.split(r"(?<=[.!?])\s+", content) if s.strip()]
-    return len(words) > 28 or (len(sentences) >= 2 and len(words) > 18)
+    if not (len(words) > 28 or (len(sentences) >= 2 and len(words) > 18)):
+        return False
+    return len(get_ontology().find_skills(content)) < 3
 
 
 def _regex_structure(text: str) -> dict[str, list[str]]:
@@ -281,6 +428,99 @@ def _regex_structure(text: str) -> dict[str, list[str]]:
         if kind in buckets:
             buckets[kind].append(content)
     return buckets
+
+
+# ── Derived must-haves (JD without a requirements section) ────────
+def _derive_must_haves(reqs: list[Requirement], buckets: dict[str, list[str]], text: str) -> list[str]:
+    """
+    A JD that only lists responsibilities (plus "Job Purpose" prose) still
+    implies mandatory skills. Run the ontology over the responsibility items
+    and the remaining prose, rank concrete skills/tools by weighted frequency
+    and first appearance, and promote up to MAX_MUST_HAVE of them. If fewer
+    than DERIVED_MUST_HAVE_MIN_SKILLS are found, the most concrete
+    responsibility items themselves become task must-haves. Mutates `reqs`
+    and returns the promoted canonical terms.
+    """
+    ont = get_ontology()
+    resp_items = [strip_bullet(i) for i in buckets.get("responsibility", [])]
+    resp_set = set(resp_items)
+    prose: list[str] = []
+    for line in _merge_wrapped_lines(text):
+        s = strip_bullet(line)
+        if s in resp_set or _header_kind(line) is not None or len(s.split()) < 3:
+            continue
+        m = re.match(r"^([A-Za-z][A-Za-z '’/&-]{2,40}):\s*(.+)$", s)   # "Job Title: Cyber security apprentice"
+        if m:
+            s = m.group(2).strip()
+        prose.append(s)
+
+    scores: dict[str, float] = {}
+    first_pos: dict[str, int] = {}
+    origin: dict[str, str] = {}
+    pos = 0
+    for base_weight, lines in ((1.0, resp_items), (0.7, prose)):
+        for line in lines:
+            weight = base_weight
+            if _ELIGIBILITY_RE.search(line) or _DERIVE_BLACKLIST_RE.search(line):
+                weight *= 0.3                 # "complete the apprenticeship…" barely counts
+            for skill in ont.find_skills(line):
+                if ont.is_soft(skill) or skill in ont.UMBRELLA:
+                    continue
+                scores[skill] = scores.get(skill, 0.0) + weight
+                first_pos.setdefault(skill, pos)
+                origin.setdefault(skill, line)
+            pos += 1
+
+    existing = {r.text: r for r in reqs}
+    covered = {a for r in reqs for a in r.alternatives}
+    derived: list[str] = []
+    for skill in sorted(scores, key=lambda s: (-scores[s], first_pos[s])):
+        if len(derived) >= MAX_MUST_HAVE:
+            break
+        if skill in covered or skill in existing:
+            continue                          # explicitly listed (e.g. under "Desirable") — respect the JD
+        reqs.append(Requirement(
+            text=skill, weight="must_have", category="skill",
+            importance=REQ_IMPORTANCE["must_have"], original_text=origin[skill].strip(),
+        ))
+        derived.append(skill)
+
+    if len(derived) < DERIVED_MUST_HAVE_MIN_SKILLS and DERIVED_TASK_MUST_HAVES > 0:
+        derived += _promote_task_must_haves(reqs, ont, DERIVED_TASK_MUST_HAVES)
+
+    order = {"must_have": 0, "preferred": 1, "responsibility": 2}
+    reqs.sort(key=lambda r: order[r.weight])
+    return derived
+
+
+def _promote_task_must_haves(reqs: list[Requirement], ont, limit: int) -> list[str]:
+    """Promote the most concrete responsibility items (domain nouns, no
+    eligibility / training / relationship statements) to task must-haves."""
+    candidates: list[tuple[float, int, Requirement]] = []
+    for idx, r in enumerate(reqs):
+        if r.weight != "responsibility" or r.category != "task":
+            continue
+        words = r.text.split()
+        if not 4 <= len(words) <= 25:
+            continue
+        if (_ELIGIBILITY_RE.search(r.text) or _DERIVE_BLACKLIST_RE.search(r.text)
+                or (_VAGUE_RE.search(r.text) and len(words) <= 6)):
+            continue
+        hits = ont.find_skills(r.text)
+        concrete = [h for h in hits if not ont.is_soft(h)]
+        # domain nouns: ontology hits, or capitalised tokens / acronyms in the original line
+        proper = len(re.findall(r"\b[A-Z][A-Za-z0-9+#]{1,}\b", r.original_text[1:]))
+        score = 2.0 * len(concrete) + 0.5 * min(proper, 4)
+        if score <= 0:
+            continue
+        candidates.append((score, idx, r))
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    promoted: list[str] = []
+    for _, _, r in candidates[:limit]:
+        r.weight = "must_have"
+        r.importance = REQ_IMPORTANCE["must_have"]
+        promoted.append(r.text)
+    return promoted
 
 
 # ── Step 2: Ollama fallback (local only) ──────────────────────────
@@ -502,6 +742,15 @@ def _build_requirements(buckets: dict[str, list[str]]) -> list[Requirement]:
         for r in must[MAX_MUST_HAVE:]:
             r.weight = "preferred"
             r.importance = REQ_IMPORTANCE["preferred"]
+    # cap the preferred list: ontology-known skills first, then named tools, then free text;
+    # the overflow is kept as responsibility context rather than dropped
+    pref = [r for r in reqs if r.weight == "preferred"]
+    if len(pref) > MAX_PREFERRED:
+        pref.sort(key=lambda r: (not ont.is_known_skill(r.text), r.category == "task",
+                                 r.category == "soft", len(r.text)))
+        for r in pref[MAX_PREFERRED:]:
+            r.weight = "responsibility"
+            r.importance = REQ_IMPORTANCE["responsibility"]
     order = {"must_have": 0, "preferred": 1, "responsibility": 2}
     reqs.sort(key=lambda r: order[r.weight])
     return reqs

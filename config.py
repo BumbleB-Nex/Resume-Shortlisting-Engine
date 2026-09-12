@@ -75,6 +75,17 @@ MANDATORY_FLOOR = 0.15
 # specific ones are demoted to preferred so the mandatory gate stays meaningful.
 MAX_MUST_HAVE = 12
 
+# Long "nice-to-have" lists (or a mis-classified competency grid) are trimmed
+# to this many preferred items; the overflow is kept as responsibility context.
+MAX_PREFERRED = 25
+
+# When a JD has no explicit requirements section (e.g. only "Key
+# Responsibilities"), the core skills mentioned in the responsibilities /
+# job-purpose prose are promoted to must-haves so the mandatory gate still
+# reflects what the recruiter expects.
+DERIVED_MUST_HAVE_MIN_SKILLS = 3   # below this, concrete responsibility items are promoted too
+DERIVED_TASK_MUST_HAVES = 3        # how many responsibility items may become task must-haves
+
 # Numeric importance stored on each Requirement
 REQ_IMPORTANCE = {
     "must_have":      1.0,
