@@ -91,12 +91,34 @@ def parse_resumes(folder_path: str | Path) -> list[Resume]:
     files = sorted((p for p in folder.iterdir()
                     if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES),
                    key=lambda p: p.name.lower())
+
+    # The same resume is often present twice (e.g. "X.pdf" and "X.docx").
+    # Keep one copy per stem so a candidate is not ranked twice; prefer the
+    # format that extracts most reliably.
+    preference = {s: i for i, s in enumerate(SUPPORTED_SUFFIXES)}
+    by_stem: dict[str, Path] = {}
+    for f in files:
+        key = f.stem.lower()
+        cur = by_stem.get(key)
+        if cur is None or preference[f.suffix.lower()] < preference[cur.suffix.lower()]:
+            by_stem[key] = f
+    files = sorted(by_stem.values(), key=lambda p: p.name.lower())
+
     resumes: list[Resume] = []
+    seen_ids: set[str] = set()
     for f in files:
         try:
-            resumes.append(parse_single_resume(f))
+            resume = parse_single_resume(f)
         except Exception as exc:  # noqa: BLE001 — one bad PDF must not kill the batch
             print(f"[resume_parser] failed on {f.name}: {exc}")
+            continue
+        # Guarantee unique IDs (UI widget keys depend on them).
+        base, cid, n = resume.candidate_id, resume.candidate_id, 2
+        while cid in seen_ids:
+            cid, n = f"{base}_{n}", n + 1
+        resume.candidate_id = cid
+        seen_ids.add(cid)
+        resumes.append(resume)
     return resumes
 
 
