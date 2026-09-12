@@ -5,6 +5,7 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import time
 from pathlib import Path
@@ -32,8 +33,25 @@ CONF_COLOR = {"HIGH": "#16a34a", "MEDIUM": "#f59e0b", "LOW": "#dc2626"}
 
 
 # ── data loading (cached) ──────────────────────────────────────────
+def code_fingerprint() -> str:
+    """md5 of the app + pipeline sources, so a code change never serves a stale
+    cache_resource entry (e.g. results computed by an older parser)."""
+    root = Path(__file__).resolve().parent
+    files = [root / "app.py", root / "config.py", *sorted((root / "pipeline").glob("*.py"))]
+    h = hashlib.md5()
+    for f in files:
+        if f.is_file():
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+CODE_HASH = code_fingerprint()
+
+
 @st.cache_resource(show_spinner=False)
-def load_state(jd_path: str, resumes_dir: str, version: int) -> tuple[list[Requirement], MatchState, str, float]:
+def load_state(jd_path: str, resumes_dir: str, version: int, code_hash: str = CODE_HASH,
+               ) -> tuple[list[Requirement], MatchState, str, float]:
     t0 = time.perf_counter()
     jd_text = jd_raw_text(jd_path)
     requirements = parse_jd_text(jd_text)
@@ -121,6 +139,9 @@ def requirement_table(r: CandidateResult) -> None:
             "Source": rs.best_chunk.section if rs.best_chunk and rs.tag != "MISSING" else "—",
             "⚠": "stuffed" if rs.is_stuffed else "",
         })
+    if not rows:
+        st.info("No requirements were extracted from this JD.")
+        return
     df = pd.DataFrame(rows)
 
     def color_tag(v):
@@ -160,6 +181,11 @@ with st.sidebar.expander("📂 Data", expanded=True):
     jd_files = sorted((p for p in JD_DIR.glob("*") if p.suffix.lower() in (".pdf", ".txt", ".docx")),
                       key=lambda p: p.stat().st_mtime, reverse=True)      # newest first
     jd_names = [p.name for p in jd_files] or ["(none found)"]
+    # A JD uploaded on the previous run is selected here, *before* the widget
+    # is instantiated (assigning to a widget key after that raises).
+    pending_jd = st.session_state.pop("pending_jd_choice", None)
+    if pending_jd in jd_names:
+        st.session_state.jd_choice = pending_jd
     if st.session_state.get("jd_choice") not in jd_names:
         st.session_state.jd_choice = jd_names[0]
     jd_choice = st.selectbox("Job description", jd_names, key="jd_choice")
@@ -176,7 +202,7 @@ with st.sidebar.expander("📂 Data", expanded=True):
         RESUMES_DIR.mkdir(parents=True, exist_ok=True)
         if up_jd is not None:
             (JD_DIR / up_jd.name).write_bytes(up_jd.getbuffer())
-            st.session_state.jd_choice = up_jd.name          # select the JD that was just uploaded
+            st.session_state.pending_jd_choice = up_jd.name   # applied on the next run
         for f in up_res or []:
             (RESUMES_DIR / f.name).write_bytes(f.getbuffer())
         st.session_state.data_version += 1
@@ -185,6 +211,9 @@ with st.sidebar.expander("📂 Data", expanded=True):
     if st.button("Clear embedding cache", use_container_width=True):
         shutil.rmtree(config.CACHE_DIR, ignore_errors=True)
         load_state.clear()
+        st.cache_resource.clear()
+        st.cache_data.clear()
+        st.session_state.data_version += 1
         st.rerun()
 
 if not jd_files:
@@ -193,7 +222,7 @@ if not jd_files:
 
 jd_path = str(JD_DIR / jd_choice)
 with st.spinner("Parsing documents, embedding evidence chunks and scoring…"):
-    requirements, state, jd_text, elapsed = load_state(jd_path, str(RESUMES_DIR), st.session_state.data_version)
+    requirements, state, jd_text, elapsed = load_state(jd_path, str(RESUMES_DIR), st.session_state.data_version, CODE_HASH)
 
 if not state.resumes:
     st.error("No resumes could be parsed from `data/resumes/`.")
@@ -208,6 +237,12 @@ by_id = {r.candidate_id: r for r in results}
 names = [f"#{r.rank} {r.name}" for r in results]
 name_to_id = {n: r.candidate_id for n, r in zip(names, results)}
 total = len(results)
+
+# Candidate pickers keep their value in session_state; after a JD / folder /
+# weight change that label may no longer exist, so validate before the widgets render.
+for _key, _default in (("detail_pick", names[0]), ("cmp_a", names[0]), ("cmp_b", names[min(1, total - 1)])):
+    if st.session_state.get(_key) not in names:
+        st.session_state[_key] = _default
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Weights in use**  \nsemantic {weights['semantic']:.0%} · keyword {weights['keyword']:.0%} · evidence {weights['evidence']:.0%}")
@@ -236,9 +271,10 @@ with tabs[0]:
 # ── Tab 2: Ranking table ───────────────────────────────────────────
 with tabs[1]:
     df = results_frame(results)
-    q = st.text_input("Filter by name / file", "")
+    q = st.text_input("Filter by name / file", "", key="rank_filter")
     if q:
-        df = df[df["Candidate"].str.contains(q, case=False) | df["File"].str.contains(q, case=False)]
+        df = df[df["Candidate"].str.contains(q, case=False, regex=False)
+                | df["File"].str.contains(q, case=False, regex=False)]
 
     def conf_style(v):
         return f"color: {CONF_COLOR.get(v, '#000')}; font-weight: 600"
@@ -252,13 +288,13 @@ with tabs[1]:
 
 # ── Tab 3: Top 3 ───────────────────────────────────────────────────
 with tabs[2]:
-    for r in results[:3]:
+    for i, r in enumerate(results[:3]):
         with st.expander(f"Rank #{r.rank} — {r.name}   ·   Score {r.final_score:.1f}   ·   {r.confidence} confidence",
                          expanded=(r.rank == 1)):
             st.write(short_summary(r))
             col_a, col_b = st.columns([1, 1])
             with col_a:
-                st.plotly_chart(breakdown_chart(r), use_container_width=True, key=f"bd_{r.candidate_id}")
+                st.plotly_chart(breakdown_chart(r), use_container_width=True, key=f"top3_bd_{i}_{r.candidate_id}")
             with col_b:
                 m_ok = ", ".join(pretty(x) for x in r.matched_required) or "—"
                 m_no = ", ".join(pretty(x) for x in r.missing_required) or "none"
@@ -288,19 +324,22 @@ with tabs[3]:
 # ── Tab 5: Compare ─────────────────────────────────────────────────
 with tabs[4]:
     c1, c2 = st.columns(2)
-    a_pick = c1.selectbox("Candidate A", names, index=0, key="cmp_a")
-    b_pick = c2.selectbox("Candidate B", names, index=min(1, total - 1), key="cmp_b")
+    a_pick = c1.selectbox("Candidate A", names, key="cmp_a")
+    b_pick = c2.selectbox("Candidate B", names, key="cmp_b")
     a, b = by_id[name_to_id[a_pick]], by_id[name_to_id[b_pick]]
+    if a.candidate_id == b.candidate_id:
+        st.info("Pick two different candidates to compare.")
     cmp = compare_candidates(a, b)
     m1, m2 = st.columns(2)
     for col, cand in ((m1, a), (m2, b)):
         col.metric(cand.name, f"{cand.final_score:.1f}", f"rank #{cand.rank}")
         col.write(f"Mandatory {cand.must_have_met}/{cand.must_have_total} · semantic {cand.semantic_agg*100:.0f} · "
                   f"keyword {cand.keyword_agg*100:.0f} · evidence {cand.evidence_agg*100:.0f} · {cand.confidence}")
+    # "A: name" / "B: name" keeps the columns distinct even when both names match
     rows = [{"Requirement": t["requirement"], "Type": t["weight"].replace("_", "-"),
-             f"{a.name}": f"{t['a_tag']} ({t['a_score']:.2f})", f"{b.name}": f"{t['b_tag']} ({t['b_score']:.2f})",
+             f"A: {a.name}": f"{t['a_tag']} ({t['a_score']:.2f})", f"B: {b.name}": f"{t['b_tag']} ({t['b_score']:.2f})",
              "Δ (A−B)": t["diff"]} for t in cmp["table"]]
-    cdf = pd.DataFrame(rows)
+    cdf = pd.DataFrame(rows, columns=["Requirement", "Type", f"A: {a.name}", f"B: {b.name}", "Δ (A−B)"])
 
     def row_color(row):
         d = row["Δ (A−B)"]
